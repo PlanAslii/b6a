@@ -1,14 +1,18 @@
 # main.py — نقطه ورود اصلی RVG Gateway
 # کاملاً بازطراحی شده برای سازگاری با تمام PaaS ها
+# رفع circular import با central.py
 
 import asyncio
 import json
 import os
+import secrets
 import sys
 import time
 from collections import deque, defaultdict
 from pathlib import Path
 from datetime import datetime, timedelta
+from contextlib import asynccontextmanager
+from urllib.parse import quote
 
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
 from fastapi.responses import Response, HTMLResponse, JSONResponse, RedirectResponse
@@ -23,22 +27,11 @@ from storage import storage
 from utils import (
     hash_password, generate_uuid, now_ir, uptime, fmt_bytes,
     parse_size_to_bytes, is_link_allowed, is_link_expired,
-    generate_vless_link, client_ip_from_request, time_ago_fa
+    generate_vless_link, client_ip_from_request
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("RVG-Gateway")
-
-# ====== تنظیم FastAPI ======
-app = FastAPI(title="RVG Gateway - codebox", docs_url=None, redoc_url=None)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # ====== متغیرهای سراسری ======
 connections: dict = {}
@@ -146,13 +139,42 @@ async def save_state():
     except Exception as e:
         logger.warning(f"Could not save state: {e}")
 
-# ====== Startup / Shutdown ======
+# ====== لینک پیش‌فرض ======
 
-@app.on_event("startup")
-async def startup():
-    """راه‌اندازی سرویس"""
+_default_link_created = False
+
+async def ensure_default_link():
+    global _default_link_created
+    if _default_link_created:
+        return
+    async with LINKS_LOCK:
+        if not any(l.get("is_default") for l in LINKS.values()):
+            uid = hashlib.sha256(f"default{config.SECRET_KEY}".encode()).hexdigest()
+            uid = f"{uid[:8]}-{uid[8:12]}-{uid[12:16]}-{uid[16:20]}-{uid[20:32]}"
+            if uid not in LINKS:
+                LINKS[uid] = {
+                    "label": "لینک پیش‌فرض",
+                    "limit_bytes": 0,
+                    "used_bytes": 0,
+                    "created_at": datetime.now().isoformat(),
+                    "active": True,
+                    "expires_at": None,
+                    "note": "",
+                    "is_default": True,
+                    "sub_id": None,
+                    "protocol": DEFAULT_PROTOCOL,
+                }
+                asyncio.create_task(save_state())
+        _default_link_created = True
+
+# ====== Lifespan ======
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """مدیریت چرخه‌ی عمر برنامه - جایگزین on_event"""
     global http_client
     
+    # ====== STARTUP ======
     # اطمینان از وجود دایرکتوری‌ها
     await storage.ensure_dirs()
     
@@ -171,50 +193,61 @@ async def startup():
     # بارگذاری داده‌ها
     await load_state()
     
+    # تنظیم central با وابستگی‌هایش
+    import central
+    central.init_central(AUTH, get_host)
+    
     # شروع heartbeat
-    asyncio.create_task(heartbeat_loop())
+    asyncio.create_task(central.heartbeat_loop())
     
     # ثبت instance در سرویس مرکزی
-    asyncio.create_task(register_instance())
+    asyncio.create_task(central.register_instance())
+    
+    # اطمینان از وجود لینک پیش‌فرض
+    await ensure_default_link()
     
     log_activity("system", "سرور راه‌اندازی شد", "ok")
     logger.info(f"RVG Gateway v9.2 started on port {config.PORT} | domain: {get_host()}")
-
-@app.on_event("shutdown")
-async def shutdown():
-    """خاموش‌سازی سرویس"""
+    
+    yield  # سرور در حال اجرا
+    
+    # ====== SHUTDOWN ======
     await save_state()
     if http_client:
         await http_client.aclose()
 
-# ====== Heartbeat ======
+# ====== تنظیم FastAPI ======
+app = FastAPI(
+    title="RVG Gateway - codebox",
+    docs_url=None,
+    redoc_url=None,
+    lifespan=lifespan
+)
 
-async def register_instance():
-    """ثبت instance در سرویس مرکزی"""
-    if not config.CENTRAL_URL:
-        return
-    try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            await c.post(f"{config.CENTRAL_URL}/api/register", json={
-                "domain": get_host(),
-                "version": get_current_version(),
-                "panel_password_hash": AUTH["password_hash"],
-                "description": "RVG Gateway instance",
-            })
-    except Exception:
-        pass
-
-async def heartbeat_loop():
-    """حلقه heartbeat"""
-    while True:
-        await register_instance()
-        await asyncio.sleep(300)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ====== ایمپورت‌های وابسته ======
-# (باید بعد از تعریف توابع مورد نیاز باشد)
+# (باید بعد از تعریف app و توابع مورد نیاز باشد)
 
-from updater import get_current_version, get_current_version_info, get_latest_version_info, perform_update, update_log, update_state, load_update_history, REPO, BRANCH, is_newer_version
-from central import fetch_announcements, report_announcement_views, fetch_support_messages, send_support_message
+from updater import (
+    get_current_version, get_current_version_info,
+    get_latest_version_info, perform_update,
+    update_log, update_state, load_update_history,
+    REPO, BRANCH, is_newer_version
+)
+
+# ایمپورت central (قبلاً import شده)
+from central import (
+    fetch_announcements, report_announcement_views,
+    fetch_support_messages, send_support_message
+)
+
 from relay_vless import websocket_tunnel
 from xhttp_siz10 import router as xhttp_router
 from pages import LOGIN_HTML, DASHBOARD_HTML, get_public_page_html
@@ -887,6 +920,7 @@ async def login_page(request: Request):
 async def dashboard(request: Request):
     if not await is_valid_session(request.cookies.get(SESSION_COOKIE)):
         return RedirectResponse(url="/login")
+    await ensure_default_link()
     return HTMLResponse(content=DASHBOARD_HTML)
 
 @app.get("/test-ws", response_class=HTMLResponse)
