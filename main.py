@@ -533,4 +533,373 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
             ed = int(body["expires_days"] or 0)
             link["expires_at"] = (datetime.now() + timedelta(days=ed)).isoformat() if ed > 0 else None
         if any(k in body for k in ("label", "note", "limit_value", "expires_days")):
-            log_activity("link", f"کانفیگ «{link['label']}» ویرایش شد",
+            log_activity("link", f"کانفیگ «{link['label']}» ویرایش شد", "info")
+        new_sub = body.get("sub_id", "UNCHANGED")
+        if new_sub != "UNCHANGED":
+            link["sub_id"] = new_sub or None
+
+    if new_sub != "UNCHANGED":
+        async with SUBS_LOCK:
+            if old_sub and old_sub in SUBS:
+                ids = SUBS[old_sub].get("link_ids", [])
+                if uid in ids:
+                    ids.remove(uid)
+            if new_sub and new_sub in SUBS:
+                ids = SUBS[new_sub].setdefault("link_ids", [])
+                if uid not in ids:
+                    ids.append(uid)
+
+    asyncio.create_task(save_state())
+    return {"ok": True}
+
+@app.delete("/api/links/{uid}")
+async def delete_link(uid: str, _=Depends(require_auth)):
+    async with LINKS_LOCK:
+        if uid not in LINKS:
+            raise HTTPException(status_code=404, detail="link not found")
+        label = LINKS[uid].get("label", uid)
+        sub_id = LINKS[uid].get("sub_id")
+        del LINKS[uid]
+    if sub_id:
+        async with SUBS_LOCK:
+            if sub_id in SUBS:
+                ids = SUBS[sub_id].get("link_ids", [])
+                if uid in ids:
+                    ids.remove(uid)
+    asyncio.create_task(save_state())
+    log_activity("link", f"کانفیگ «{label}» حذف شد", "err")
+    return {"ok": True, "deleted": uid}
+
+# ====== Sub Groups ======
+
+@app.post("/api/subs")
+async def create_sub(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    name = (body.get("name") or "گروه جدید").strip()[:60]
+    desc = (body.get("desc") or "").strip()[:200]
+    password = (body.get("password") or "").strip()
+    sub_id = generate_uuid()
+    uuid_key = secrets.token_urlsafe(16)
+    async with SUBS_LOCK:
+        SUBS[sub_id] = {
+            "name": name,
+            "desc": desc,
+            "password_hash": hash_password(password) if password else None,
+            "uuid_key": uuid_key,
+            "created_at": datetime.now().isoformat(),
+            "link_ids": [],
+        }
+    asyncio.create_task(save_state())
+    log_activity("sub", f"گروه «{name}» ساخته شد", "ok")
+    host = get_host()
+    return {
+        "sub_id": sub_id,
+        **SUBS[sub_id],
+        "public_url": f"https://{host}/p/{uuid_key}",
+        "sub_url": f"https://{host}/sub-group/{uuid_key}",
+    }
+
+@app.get("/api/subs")
+async def list_subs(_=Depends(require_auth)):
+    host = get_host()
+    async with SUBS_LOCK:
+        snap_subs = dict(SUBS)
+    async with LINKS_LOCK:
+        snap_links = dict(LINKS)
+    result = []
+    for sid, s in snap_subs.items():
+        link_ids = s.get("link_ids", [])
+        active_count = sum(1 for lid in link_ids if is_link_allowed(snap_links.get(lid)))
+        total_used = sum(snap_links[lid].get("used_bytes", 0) for lid in link_ids if lid in snap_links)
+        result.append({
+            "sub_id": sid,
+            **s,
+            "password_hash": None,
+            "has_password": s.get("password_hash") is not None,
+            "links_count": len(link_ids),
+            "active_count": active_count,
+            "total_used_bytes": total_used,
+            "total_used_fmt": fmt_bytes(total_used),
+            "public_url": f"https://{host}/p/{s['uuid_key']}",
+            "sub_url": f"https://{host}/sub-group/{s['uuid_key']}",
+        })
+    result.sort(key=lambda x: x["created_at"], reverse=True)
+    return {"subs": result}
+
+@app.patch("/api/subs/{sub_id}")
+async def update_sub(sub_id: str, request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    async with SUBS_LOCK:
+        if sub_id not in SUBS:
+            raise HTTPException(status_code=404, detail="sub not found")
+        s = SUBS[sub_id]
+        if "name" in body:
+            s["name"] = str(body["name"])[:60]
+        if "desc" in body:
+            s["desc"] = str(body["desc"])[:200]
+        if "password" in body:
+            pw = str(body["password"]).strip()
+            s["password_hash"] = hash_password(pw) if pw else None
+        if "link_ids" in body:
+            s["link_ids"] = list(body["link_ids"])
+    asyncio.create_task(save_state())
+    return {"ok": True}
+
+@app.delete("/api/subs/{sub_id}")
+async def delete_sub(sub_id: str, _=Depends(require_auth)):
+    async with SUBS_LOCK:
+        if sub_id not in SUBS:
+            raise HTTPException(status_code=404, detail="sub not found")
+        name = SUBS[sub_id].get("name", sub_id)
+        del SUBS[sub_id]
+    async with LINKS_LOCK:
+        for link in LINKS.values():
+            if link.get("sub_id") == sub_id:
+                link["sub_id"] = None
+    asyncio.create_task(save_state())
+    log_activity("sub", f"گروه «{name}» حذف شد", "warn")
+    return {"ok": True, "deleted": sub_id}
+
+@app.post("/api/subs/{sub_id}/links")
+async def assign_link_to_sub(sub_id: str, request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    link_id = str(body.get("link_id", ""))
+    action = str(body.get("action", "add"))
+    async with SUBS_LOCK:
+        if sub_id not in SUBS:
+            raise HTTPException(status_code=404, detail="sub not found")
+        s = SUBS[sub_id]
+        ids = s.setdefault("link_ids", [])
+        if action == "add":
+            if link_id not in ids:
+                ids.append(link_id)
+        else:
+            if link_id in ids:
+                ids.remove(link_id)
+    async with LINKS_LOCK:
+        if link_id in LINKS:
+            LINKS[link_id]["sub_id"] = sub_id if action == "add" else None
+    asyncio.create_task(save_state())
+    return {"ok": True}
+
+# ====== HTTP Proxy ======
+
+_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+        "te", "trailers", "transfer-encoding", "upgrade", "content-encoding", "content-length"}
+
+@app.api_route("/proxy/{target_url:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
+async def http_proxy(target_url: str, request: Request):
+    if not target_url.startswith("http"):
+        target_url = "https://" + target_url
+    try:
+        body = await request.body()
+        headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP and k.lower() != "host"}
+        resp = await http_client.request(method=request.method, url=target_url, headers=headers, content=body)
+        stats["total_bytes"] += len(resp.content)
+        stats["total_requests"] += 1
+        hourly_traffic[now_ir().strftime("%H:00")] += len(resp.content)
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers={k: v for k, v in resp.headers.items() if k.lower() not in _HOP}
+        )
+    except Exception as exc:
+        stats["total_errors"] += 1
+        error_logs.append({"error": str(exc), "url": target_url, "time": datetime.now().isoformat()})
+        raise HTTPException(status_code=502, detail=f"Proxy error: {exc}")
+
+# ====== Public Sub Page ======
+
+@app.get("/p/{uuid_key}", response_class=HTMLResponse)
+async def public_sub_page(uuid_key: str, request: Request):
+    async with SUBS_LOCK:
+        sub = next(({"sub_id": sid, **s} for sid, s in SUBS.items() if s.get("uuid_key") == uuid_key), None)
+    if not sub:
+        return HTMLResponse("<h2 style='font-family:sans-serif;padding:40px'>گروه پیدا نشد</h2>", status_code=404)
+    return HTMLResponse(content=get_public_page_html(uuid_key))
+
+@app.get("/api/public/sub/{uuid_key}")
+async def public_sub_data(uuid_key: str, request: Request):
+    async with SUBS_LOCK:
+        sub_entry = next(((sid, s) for sid, s in SUBS.items() if s.get("uuid_key") == uuid_key), None)
+    if not sub_entry:
+        raise HTTPException(status_code=404, detail="not found")
+    sub_id, sub = sub_entry
+
+    has_pw = sub.get("password_hash") is not None
+    if has_pw:
+        pw = request.query_params.get("pw", "")
+        if hash_password(pw) != sub["password_hash"]:
+            return JSONResponse({"locked": True, "name": sub["name"]})
+
+    host = get_host()
+    link_ids = sub.get("link_ids", [])
+    async with LINKS_LOCK:
+        snap = dict(LINKS)
+
+    links_out = []
+    active_conns = 0
+    for lid in link_ids:
+        link = snap.get(lid)
+        if not link:
+            continue
+        allowed = is_link_allowed(link)
+        conn_count = sum(1 for c in connections.values() if c.get("uuid") == lid)
+        active_conns += conn_count
+        proto = link.get("protocol", DEFAULT_PROTOCOL)
+        links_out.append({
+            "uuid": lid,
+            "label": link["label"],
+            "active": allowed,
+            "protocol": proto,
+            "used_bytes": link.get("used_bytes", 0),
+            "used_fmt": fmt_bytes(link.get("used_bytes", 0)),
+            "limit_bytes": link.get("limit_bytes", 0),
+            "limit_fmt": "∞" if link.get("limit_bytes", 0) == 0 else fmt_bytes(link["limit_bytes"]),
+            "expires_at": link.get("expires_at"),
+            "vless_link": generate_vless_link(lid, host, remark=f"RVG-{link['label']}", protocol=proto),
+            "sub_url": f"https://{host}/sub/{lid}",
+            "connections": conn_count,
+        })
+
+    total_used = sum(l["used_bytes"] for l in links_out)
+    return {
+        "locked": False,
+        "name": sub["name"],
+        "desc": sub.get("desc", ""),
+        "sub_url": f"https://{host}/sub-group/{uuid_key}",
+        "active_connections": active_conns,
+        "total_used_fmt": fmt_bytes(total_used),
+        "links": links_out,
+    }
+
+# ====== Announcements & Support ======
+
+@app.get("/api/announcements")
+async def api_announcements(_=Depends(require_auth)):
+    return {"announcements": await fetch_announcements()}
+
+@app.post("/api/announcements/view")
+async def api_announcements_view(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    ids = body.get("ids", [])
+    if not isinstance(ids, list):
+        raise HTTPException(status_code=400, detail="invalid ids")
+    await report_announcement_views([str(i) for i in ids][:100])
+    return {"ok": True}
+
+@app.get("/api/support/messages")
+async def api_support_messages(_=Depends(require_auth)):
+    messages, blocked = await fetch_support_messages()
+    return {"messages": messages, "blocked": blocked}
+
+@app.post("/api/support/send")
+async def api_support_send(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    msg = str(body.get("message", "")).strip()[:2000]
+    if not msg:
+        raise HTTPException(status_code=400, detail="پیام خالی است")
+    result = await send_support_message(msg)
+    if result.get("blocked"):
+        raise HTTPException(status_code=403, detail="شما توسط پشتیبانی بلاک شده‌اید")
+    if not result.get("ok"):
+        raise HTTPException(status_code=502, detail=result.get("error") or "ارتباط با سرور مرکزی برقرار نشد")
+    return {"ok": True}
+
+# ====== Version / Update ======
+
+@app.get("/api/version")
+async def api_version(_=Depends(require_auth)):
+    current_info = get_current_version_info()
+    latest_info = await get_latest_version_info()
+    latest_ver = latest_info.get("version")
+    update_available = is_newer_version(latest_ver, current_info["version"]) if latest_ver else False
+    return {
+        "repo": REPO,
+        "branch": BRANCH,
+        "current": current_info,
+        "latest": latest_info,
+        "update_available": update_available,
+    }
+
+@app.get("/api/update-history")
+async def api_update_history(_=Depends(require_auth)):
+    return {"history": load_update_history()}
+
+@app.get("/api/update-log")
+async def api_update_log(_=Depends(require_auth)):
+    return {"running": update_state["running"], "progress": update_state["progress"], "logs": list(update_log)[-100:]}
+
+@app.post("/api/update")
+async def api_update(_=Depends(require_auth)):
+    if update_state["running"]:
+        raise HTTPException(status_code=409, detail="بروزرسانی در حال اجراست")
+
+    update_log.append({"time": time.time(), "msg": "درخواست بروزرسانی ثبت شد، در صف اجرا..."})
+
+    async def _run():
+        ok = False
+        try:
+            ok = await perform_update()
+        except Exception as exc:
+            import traceback as tb
+            update_log.append({"time": time.time(), "msg": f"❌ خطای بحرانی: {exc}"})
+            update_log.append({"time": time.time(), "msg": tb.format_exc()[-800:]})
+            update_state["running"] = False
+        try:
+            await save_state()
+            log_activity("system", "بروزرسانی پنل " + ("موفق" if ok else "ناموفق") + " بود", "ok" if ok else "err")
+        except Exception:
+            pass
+
+        if ok:
+            update_log.append({"time": time.time(), "msg": "در حال راه‌اندازی مجدد پروسه (بدون خاموش‌شدن کانتینر)..."})
+            await asyncio.sleep(1.5)
+            try:
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+            except Exception as exc:
+                update_log.append({"time": time.time(), "msg": f"❌ execv شکست خورد: {exc} — fallback به exit"})
+                os._exit(0)
+
+    task = asyncio.create_task(_run())
+
+    def _on_done(t: asyncio.Task):
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc:
+            update_log.append({"time": time.time(), "msg": f"❌ Task crash: {exc}"})
+            update_state["running"] = False
+
+    task.add_done_callback(_on_done)
+    log_activity("system", "درخواست بروزرسانی پنل ثبت شد", "info")
+    return {"ok": True, "started": True}
+
+# ====== Pages ======
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request):
+    if await is_valid_session(request.cookies.get(SESSION_COOKIE)):
+        return RedirectResponse(url="/dashboard")
+    return HTMLResponse(content=LOGIN_HTML)
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard(request: Request):
+    if not await is_valid_session(request.cookies.get(SESSION_COOKIE)):
+        return RedirectResponse(url="/login")
+    return HTMLResponse(content=DASHBOARD_HTML)
+
+@app.get("/test-ws", response_class=HTMLResponse)
+async def test_ws_redirect():
+    return HTMLResponse(content="<script>location.href='/dashboard'</script>")
+
+# ====== Main ======
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=config.PORT,
+        log_level="info",
+        workers=config.WORKERS
+    )
