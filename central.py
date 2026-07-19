@@ -1,4 +1,5 @@
 # central.py — ارتباط با سرویس مرکزی روی Cloudflare Worker
+# اصلاح شده برای جلوگیری از circular import
 import os
 import asyncio
 import httpx
@@ -13,8 +14,8 @@ _AUTH = None
 _get_host = None
 
 
-def _init_central(auth, get_host_func):
-    """تنظیم وابستگی‌های دایره‌ای"""
+def init_central(auth, get_host_func):
+    """تنظیم وابستگی‌های دایره‌ای - باید از main صدا زده شود"""
     global _AUTH, _get_host
     _AUTH = auth
     _get_host = get_host_func
