@@ -1,0 +1,94 @@
+# central.py — ارتباط با سرویس مرکزی روی Cloudflare Worker
+# اصلاح‌شده: استفاده از config
+
+import os
+import asyncio
+import httpx
+
+from config import config
+from main import AUTH, get_host
+from updater import get_current_version
+
+CENTRAL_URL = config.CENTRAL_URL
+
+
+async def register_instance():
+    if not CENTRAL_URL:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            await c.post(f"{CENTRAL_URL}/api/register", json={
+                "domain": get_host(),
+                "version": get_current_version(),
+                "panel_password_hash": AUTH["password_hash"],
+                "description": "RVG Gateway instance",
+            })
+    except Exception:
+        pass
+
+
+async def heartbeat_loop():
+    while True:
+        await register_instance()
+        await asyncio.sleep(300)
+
+
+async def fetch_announcements():
+    if not CENTRAL_URL:
+        return []
+    from main import get_host
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(f"{CENTRAL_URL}/api/announcements", params={"domain": get_host()})
+            r.raise_for_status()
+            return r.json().get("announcements", [])
+    except Exception:
+        return []
+
+
+async def report_announcement_views(ids: list[str]):
+    if not CENTRAL_URL or not ids:
+        return
+    from main import get_host
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            await c.post(f"{CENTRAL_URL}/api/announcements/view", json={
+                "domain": get_host(),
+                "ids": ids,
+            })
+    except Exception:
+        pass
+
+
+async def fetch_support_messages():
+    if not CENTRAL_URL:
+        return [], False
+    from main import get_host
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(f"{CENTRAL_URL}/api/support/messages", params={"domain": get_host()})
+            r.raise_for_status()
+            d = r.json()
+            return d.get("messages", []), bool(d.get("blocked", False))
+    except Exception:
+        return [], False
+
+
+async def send_support_message(body: str) -> dict:
+    if not CENTRAL_URL:
+        return {"ok": False, "blocked": False, "error": "CENTRAL_URL تنظیم نشده"}
+    from main import get_host
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(f"{CENTRAL_URL}/api/support/send", json={"domain": get_host(), "body": body})
+            if r.status_code == 403:
+                return {"ok": False, "blocked": True}
+            if r.status_code != 200:
+                return {"ok": False, "blocked": False, "error": f"HTTP {r.status_code}: {r.text[:200]}"}
+            return {"ok": True, "blocked": False}
+    except Exception as e:
+        return {"ok": False, "blocked": False, "error": str(e)}
+
+
+async def close_support_chat() -> bool:
+    return False
