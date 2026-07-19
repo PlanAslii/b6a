@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+websockets
+httpx
+itsdangerous
+redis>=5.0.1
